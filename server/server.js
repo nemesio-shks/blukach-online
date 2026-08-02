@@ -10,7 +10,9 @@
 //  (переживёт до перезапуска; на free Render этого достаточно для теста).
 //
 //  ENV (задать в Render → Environment):
-//    EDITOR_PASSWORD        — пароль, который вводит редактор на сайте
+//    EDITOR_PASSWORD        — пароль полного редактора (правит всё)
+//    OPS_PASSWORD           — пароль ограниченного редактора (правит ТОЛЬКО
+//                             операторов экипажа — ship.operators/crewStatus)
 //    UPSTASH_REDIS_REST_URL — из Upstash (Redis → REST API)
 //    UPSTASH_REDIS_REST_TOKEN
 //    ALLOW_ORIGIN           — необязательно; по умолчанию "*"
@@ -25,6 +27,7 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3778;
 const EDITOR_PASSWORD = process.env.EDITOR_PASSWORD || "changeme";
+const OPS_PASSWORD = process.env.OPS_PASSWORD || "";   // пусто = роль отключена
 const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
 
 const U_URL = process.env.UPSTASH_REDIS_REST_URL || "";
@@ -32,7 +35,8 @@ const U_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "";
 const REDIS_KEY = "galaxy:state";
 
 // токен-сессия редактора (выдаётся на /login, живёт в памяти процесса)
-const editorTokens = new Set();
+// значение — роль: "full" (всё) | "ops" (только операторы экипажа)
+const editorTokens = new Map();
 
 // --------------------------------------------------------------------------
 //  Хранилище
@@ -101,10 +105,23 @@ function readBody(req) {
   });
 }
 
-function isEditor(req) {
+function tokenRole(req) {
   const h = req.headers.authorization || "";
   const t = h.startsWith("Bearer ") ? h.slice(7) : "";
-  return t && editorTokens.has(t);
+  return t ? (editorTokens.get(t) || null) : null;
+}
+
+// ограниченная роль "ops" может менять ТОЛЬКО ship.operators/crewStatus —
+// всё остальное в присланных данных должно совпадать с уже сохранённым состоянием.
+// deep-equal через JSON.stringify (структуры простые/сериализуемые — этого достаточно).
+function sameExceptOps(prev, next) {
+  if (!prev) return true;   // нет прежнего состояния — сравнивать не с чем, пропускаем
+  const stripOps = (d) => {
+    const c = JSON.parse(JSON.stringify(d || {}));
+    if (c.ship) { delete c.ship.operators; delete c.ship.crewStatus; }
+    return c;
+  };
+  return JSON.stringify(stripOps(prev)) === JSON.stringify(stripOps(next));
 }
 
 const server = http.createServer(async (req, res) => {
@@ -123,24 +140,36 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ data, ts: Date.now() }));
     }
 
-    // логин редактора → выдаём временный токен
+    // логин редактора → выдаём временный токен + роль ("full" полный / "ops" только операторы)
     if (req.method === "POST" && req.url === "/login") {
       const body = await readBody(req);
-      if (String(body.password || "") === EDITOR_PASSWORD) {
+      const pass = String(body.password || "");
+      let role = null;
+      if (pass === EDITOR_PASSWORD) role = "full";
+      else if (OPS_PASSWORD && pass === OPS_PASSWORD) role = "ops";
+      if (role) {
         const token = crypto.randomBytes(24).toString("hex");
-        editorTokens.add(token);
+        editorTokens.set(token, role);
         cors(res);
-        return res.end(JSON.stringify({ ok: true, token }));
+        return res.end(JSON.stringify({ ok: true, token, role }));
       }
       cors(res, { code: 401 });
       return res.end(JSON.stringify({ ok: false, error: "bad password" }));
     }
 
-    // запись состояния (только редактор)
+    // запись состояния (редактор full — всё; редактор ops — только операторы экипажа)
     if (req.method === "POST" && req.url === "/state") {
-      if (!isEditor(req)) { cors(res, { code: 403 }); return res.end(JSON.stringify({ ok: false, error: "forbidden" })); }
+      const role = tokenRole(req);
+      if (!role) { cors(res, { code: 403 }); return res.end(JSON.stringify({ ok: false, error: "forbidden" })); }
       const body = await readBody(req);
       if (!body || !body.data) { cors(res, { code: 400 }); return res.end(JSON.stringify({ ok: false, error: "no data" })); }
+      if (role === "ops") {
+        const prev = await loadState();
+        if (!sameExceptOps(prev, body.data)) {
+          cors(res, { code: 403 });
+          return res.end(JSON.stringify({ ok: false, error: "ops role can only edit crew operators" }));
+        }
+      }
       await saveState(body.data);
       cors(res);
       return res.end(JSON.stringify({ ok: true }));

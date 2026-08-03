@@ -111,17 +111,22 @@ function tokenRole(req) {
   return t ? (editorTokens.get(t) || null) : null;
 }
 
-// ограниченная роль "ops" может менять ТОЛЬКО ship.operators/crewStatus —
-// всё остальное в присланных данных должно совпадать с уже сохранённым состоянием.
-// deep-equal через JSON.stringify (структуры простые/сериализуемые — этого достаточно).
-function sameExceptOps(prev, next) {
-  if (!prev) return true;   // нет прежнего состояния — сравнивать не с чем, пропускаем
-  const stripOps = (d) => {
-    const c = JSON.parse(JSON.stringify(d || {}));
-    if (c.ship) { delete c.ship.operators; delete c.ship.crewStatus; }
-    return c;
-  };
-  return JSON.stringify(stripOps(prev)) === JSON.stringify(stripOps(next));
+// ограниченная роль "ops" может менять ТОЛЬКО ship.operators/crewStatus.
+// ⚠ РАНЬШЕ это проверялось строгим сравнением «всё остальное совпадает с prev»
+// и при малейшей гонке (пока ops-клиент правил операторов, где-то на сервере успело
+// измениться что-то ещё — обычный тик игры/другой редактор) запись блокировалась 403,
+// клиент терял токен и editOps() «ломался» (падал в read-only) — тот самый баг.
+// Теперь вместо сравнения — просто МЕРЖИМ: берём свежий prev из БД «как есть» и
+// накладываем поверх него только operators/crewStatus из присланных данных.
+// Гонка становится невозможной в принципе — ops физически не может задеть ничего,
+// кроме этих двух полей, независимо от того, что успело поменяться параллельно.
+function mergeOpsOnly(prev, next) {
+  const base = JSON.parse(JSON.stringify(prev || next || {}));
+  if (!base.ship) base.ship = {};
+  const src = (next && next.ship) || {};
+  base.ship.operators = src.operators;
+  base.ship.crewStatus = src.crewStatus;
+  return base;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -163,14 +168,12 @@ const server = http.createServer(async (req, res) => {
       if (!role) { cors(res, { code: 403 }); return res.end(JSON.stringify({ ok: false, error: "forbidden" })); }
       const body = await readBody(req);
       if (!body || !body.data) { cors(res, { code: 400 }); return res.end(JSON.stringify({ ok: false, error: "no data" })); }
+      let toSave = body.data;
       if (role === "ops") {
         const prev = await loadState();
-        if (!sameExceptOps(prev, body.data)) {
-          cors(res, { code: 403 });
-          return res.end(JSON.stringify({ ok: false, error: "ops role can only edit crew operators" }));
-        }
+        toSave = mergeOpsOnly(prev, body.data);
       }
-      await saveState(body.data);
+      await saveState(toSave);
       cors(res);
       return res.end(JSON.stringify({ ok: true }));
     }

@@ -141,8 +141,27 @@ const server = http.createServer(async (req, res) => {
     // чтение состояния (всем)
     if (req.method === "GET" && (req.url === "/state" || req.url.startsWith("/state?"))) {
       const data = await loadState();
-      cors(res);
-      return res.end(JSON.stringify({ data, ts: Date.now() }));
+      const body = JSON.stringify({ data, ts: Date.now() });
+      // ETag по содержимому data (без ts) — экономия трафика: если данные не менялись
+      // с прошлого запроса (частый случай при опросе раз в N сек), отдаём 304 без тела.
+      const etag = '"' + crypto.createHash("md5").update(JSON.stringify(data)).digest("hex") + '"';
+      if (req.headers["if-none-match"] === etag) {
+        res.writeHead(304, {
+          "Access-Control-Allow-Origin": ALLOW_ORIGIN,
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+          ETag: etag,
+        });
+        return res.end();
+      }
+      res.writeHead(200, {
+        "Access-Control-Allow-Origin": ALLOW_ORIGIN,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        "Content-Type": "application/json; charset=utf-8",
+        ETag: etag,
+      });
+      return res.end(body);
     }
 
     // логин редактора → выдаём временный токен + роль ("full" полный / "ops" только операторы)
